@@ -160,7 +160,7 @@ public partial class MainWindow : Window
         {
             BtnInstallDriver.Content = "一键安装虚拟声卡";
             BtnInstallDriver.IsEnabled = true;
-            MessageBox.Show(err, "安装失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+            System.Windows.MessageBox.Show(err, "安装失败", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
         // 安装完重新探测
