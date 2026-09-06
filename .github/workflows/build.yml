@@ -41,14 +41,17 @@ jobs:
         run: |
           dotnet publish -c Release -r win-x64 --self-contained /p:PublishSingleFile=true 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
-      - name: Report build log on failure
+      - name: Push build log to branch on failure
         if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          $log = Get-Content windows/build.log -Tail 80 -Raw
-          gh label create build-failure --force | Out-Null
-          gh issue create --title "[auto] windows build failure $(Get-Date -Format s)" --body "````n$log`n```" --label build-failure
+          mkdir -p logs
+          tail -n 120 windows/build.log > logs/win-error.txt || true
+          git config user.name ci && git config user.email ci@users.noreply.github.com
+          git checkout --orphan build-logs || true
+          git add logs/win-error.txt -f
+          git commit -m "build log $(date +%s)" -q
+          git push -f origin build-logs
       - name: Stash EXE
         uses: actions/upload-artifact@v4
         with:
