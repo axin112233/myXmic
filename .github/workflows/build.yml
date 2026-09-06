@@ -41,6 +41,11 @@ jobs:
         run: |
           dotnet publish -c Release -r win-x64 --self-contained /p:PublishSingleFile=true 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Publish portable (no single-file)
+        working-directory: windows
+        run: dotnet publish -c Release -r win-x64 --self-contained /p:PublishSingleFile=false -o publish-portable
+      - name: Zip portable
+        run: Compress-Archive -Path windows/publish-portable/* -DestinationPath windows/myXmic-portable.zip
       - name: Push build log to branch on failure
         if: failure()
         shell: bash
@@ -57,6 +62,11 @@ jobs:
         with:
           name: exe
           path: windows/bin/Release/net6.0-windows/win-x64/publish/myXmic.exe
+      - name: Stash portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: exe-portable
+          path: windows/myXmic-portable.zip
 
   release:
     needs: [android-apk, windows-exe]
@@ -70,6 +80,7 @@ jobs:
           mkdir out
           cp dist/apk/app-debug.apk out/myXmic.apk
           cp dist/exe/myXmic.exe out/myXmic.exe
+          cp dist/exe-portable/myXmic-portable.zip out/myXmic-portable.zip
       - name: 发布到 Release (tag=latest)
         uses: softprops/action-gh-release@v2
         with:
