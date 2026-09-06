@@ -190,13 +190,13 @@ public partial class MainWindow : Window
     private void MonGain_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
         _server.MonitorGain = (float)e.NewValue;
-        TxtMonGain.Text = $"{(int)(e.NewValue * 100)}%";
+        if (TxtMonGain != null) TxtMonGain.Text = $"{(int)(e.NewValue * 100)}%";
     }
 
     private void GainSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
         _server.Gain = (float)e.NewValue;
-        TxtGain.Text = $"{(int)(e.NewValue * 100)}%";
+        if (TxtGain != null) TxtGain.Text = $"{(int)(e.NewValue * 100)}%";
     }
 
     // ---------- 语言 ----------

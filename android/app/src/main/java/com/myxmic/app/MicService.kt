@@ -45,6 +45,9 @@ class MicService : Service() {
         const val EXTRA_NS = "ns"
         const val EXTRA_AEC = "aec"
         private const val CHANNEL_ID = "mic"
+        const val ACTION_LEVEL = "com.myxmic.app.LEVEL"
+        const val EXTRA_LEVEL = "level"
+        const val EXTRA_STATE = "state"
         private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     }
 
@@ -171,15 +174,18 @@ class MicService : Service() {
             val pcm = ByteArray(frameBytes)
 
             record.startRecording()
+            reportState("streaming")
             while (running.get()) {
                 val n = record.read(pcm, 0, pcm.size)
                 if (n <= 0) continue
                 if (gain != 1f) applyGain(pcm, n, gain)
+                reportLevel(pcm, n)
                 System.arraycopy(pcm, 0, txBuf, 4, n)
                 transport.send(txBuf.copyOf(4 + n))
             }
         } catch (e: Exception) {
             android.util.Log.e("MicService", "stream failed", e)
+            reportState("error:" + (e.message ?: "?"))
         } finally {
             try { record.stop() } catch (_: Throwable) {}
             record.release()
@@ -187,6 +193,25 @@ class MicService : Service() {
             try { transport?.close() } catch (_: Throwable) {}
             running.set(false)
         }
+    }
+
+    private fun reportState(s: String) =
+        sendBroadcast(Intent(ACTION_LEVEL).putExtra(EXTRA_STATE, s))
+
+    private var lastLevelAt = 0L
+    private fun reportLevel(pcm: ByteArray, n: Int) {
+        val now = System.currentTimeMillis()
+        if (now - lastLevelAt < 200) return
+        lastLevelAt = now
+        var max = 0
+        var i = 0
+        while (i + 1 < n) {
+            val v = Math.abs((((pcm[i + 1].toInt() and 0xFF) shl 8) or (pcm[i].toInt() and 0xFF))
+                .toShort().toInt())
+            if (v > max) max = v
+            i += 2
+        }
+        sendBroadcast(Intent(ACTION_LEVEL).putExtra(EXTRA_LEVEL, max / 32768f))
     }
 
     private fun applyGain(buf: ByteArray, n: Int, g: Float) {
