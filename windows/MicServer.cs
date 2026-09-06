@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using NAudio.CoreAudioApi;
@@ -5,114 +6,176 @@ using NAudio.Wave;
 
 namespace myXmic;
 
-public enum Transport { Tcp, Udp, Bluetooth }
+public enum Transport { Tcp, Udp, Usb, Bluetooth }
 
 /// <summary>
-/// 只启动用户选定的一种通道接收 48kHz(或16kHz)/16bit/mono PCM → WASAPI → CABLE Input。
-/// 声道切换时 Android 端会以数据帧头协商，这里按首包自适配采样率。
+/// 音频中枢：一条通道接收手机 PCM → 写入虚拟声卡(=其他应用可用的麦克风)
+/// 侦听开启时，并行复制到默认扬声器（独立开关、互不影响）。
 /// </summary>
 public class MicServer : IDisposable
 {
     public event Action<string>? OnLog;
     public event Action<string>? OnClientChanged;
-    public event Action<float>? OnLevel;
+    public event Action<float>? OnLevel;        // 0..1
+    public event Action<int>? OnBitrate;        // kbps
 
     private CancellationTokenSource? _cts;
-    private MMDevice? _renderDevice;
-    private WasapiOut? _player;
-    private BufferedWaveProvider? _provider;
+    private MMDeviceEnumerator? _enum;
+    private MMDevice? _cableRender;             // CABLE Input (虚拟声卡播放端)
+    private MMDevice? _defaultSpeaker;          // 默认扬声器（侦听用）
+    private WasapiOut? _cablePlayer;
+    private WasapiOut? _monitorPlayer;          // 侦听播放器（仅开启时存在）
+    private BufferedWaveProvider? _cableBuf;
+    private BufferedWaveProvider? _monitorBuf;
     private Task? _listenerTask;
+    private Task? _usbRetryTask;
+
     private volatile float _gain = 1.0f;
+    private volatile float _monitorGain = 1.0f;
+    private volatile bool _monitorEnabled;
     private volatile int _sampleRate = 48000;
+    private long _bytesWindow;
+    private long _windowStart = Environment.TickCount64;
 
-    /// <summary>音量增益 0.5 ~ 3.0，热生效。</summary>
-    public float Gain
+    public bool MonitorEnabled
     {
-        get => _gain;
-        set => _gain = Math.Clamp(value, 0.1f, 3.5f);
-    }
-
-    public MMDevice? FindCable()
-    {
-        var en = new MMDeviceEnumerator();
-        return en.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                 .FirstOrDefault(d => d.FriendlyName.Contains("CABLE Input",
-                     StringComparison.OrdinalIgnoreCase));
-    }
-
-    private void EnsurePlayer()
-    {
-        if (_player != null && _sampleRate == _provider!.WaveFormat.SampleRate) return;
-        try { _player?.Stop(); _player?.Dispose(); } catch { }
-        var format = new WaveFormat(_sampleRate, 16, 1);
-        _provider = new BufferedWaveProvider(format)
+        get => _monitorEnabled;
+        set
         {
-            BufferDuration = TimeSpan.FromMilliseconds(300),
-            DiscardOnBufferOverflow = true,
-            ReadFully = true
-        };
-        _player = new WasapiOut(_renderDevice!, AudioClientShareMode.Shared, false, 30);
-        _player.Init(_provider);
-        _player.Play();
+            _monitorEnabled = value;
+            if (value) StartMonitor(); else StopMonitor();
+        }
     }
 
-    public bool Start(Transport mode, int port)
+    public float Gain { get => _gain; set => _gain = Math.Clamp(value, 0.1f, 3.5f); }
+    public float MonitorGain { get => _monitorGain; set => _monitorGain = Math.Clamp(value, 0f, 3f); }
+
+    public string CurrentMode { get; private set; } = "-";
+    public int CurrentPort { get; private set; }
+
+    public MMDevice? FindCable() =>
+        GetEnumerator().EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+            .FirstOrDefault(d => d.FriendlyName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase));
+
+    private MMDeviceEnumerator GetEnumerator() => _enum ??= new MMDeviceEnumerator();
+
+    // ---------- 通道 ----------
+
+    public bool Start(Transport mode, int port, Action<string>? log = null)
     {
         _cts = new CancellationTokenSource();
-        _renderDevice = FindCable();
-        if (_renderDevice == null)
+        _cableRender = FindCable();
+        if (_cableRender == null)
         {
-            OnLog?.Invoke("未找到 CABLE Input，请先安装 VB-CABLE");
+            OnLog?.Invoke("未找到 CABLE Input，请先安装虚拟声卡");
             return false;
         }
-        EnsurePlayer();
+        EnsureCablePlayer();
+
+        CurrentMode = mode.ToString();
+        CurrentPort = port;
+
+        // 侦听默认扬声器只在用户开勾选时才拿
+        if (_monitorEnabled) StartMonitor();
 
         _listenerTask = mode switch
         {
-            Transport.Tcp => Task.Run(() => TcpLoop(port, _cts.Token)),
+            Transport.Tcp => Task.Run(() => TcpLoop(IPAddress.Any, port, _cts.Token)),
             Transport.Udp => Task.Run(() => UdpLoop(port, _cts.Token)),
+            Transport.Usb => Task.Run(() => UsbLoop(port, _cts.Token)),
             Transport.Bluetooth => Task.Run(() => BtLoop(_cts.Token)),
             _ => Task.CompletedTask
         };
         return true;
     }
 
-    // ---------- 接收循环（每个 DataChunk: [4B采样率标志?] + PCM） ----------
-
-    private void Feed(byte[] buf, int n)
+    public void Stop()
     {
-        // 协议约定：前 4 字节为小端采样率，之后为 PCM；手机每帧都带头
-        if (n >= 4)
-        {
-            int sr = BitConverter.ToInt32(buf, 0);
-            if (sr is 48000 or 16000 or 44100)
-            {
-                if (sr != _sampleRate)
-                {
-                    _sampleRate = sr;
-                    System.Windows.Application.Current?.Dispatcher.Invoke((Action)EnsurePlayer);
-                }
-                Feed(buf, 4, n - 4);
-                return;
-            }
-        }
-        Feed(buf, 0, n);
+        _cts?.Cancel();
+        try { StopMonitor(); } catch { }
+        try { _cablePlayer?.Stop(); _cablePlayer?.Dispose(); } catch { }
+        _cablePlayer = null;
+        try { _cableRender?.Dispose(); } catch { }
+        _cableRender = null;
+        _usbRetryTask = null;
+        OnLevel?.Invoke(0);
+        OnBitrate?.Invoke(0);
     }
 
-    private void Feed(byte[] buf, int off, int n)
+    public void Dispose() { Stop(); try { _enum?.Dispose(); } catch { } }
+
+    // ---------- 播放端构建 ----------
+
+    private void EnsureCablePlayer()
     {
-        if (_provider == null) return;
-        if (Math.Abs(_gain - 1f) > 0.01f)
+        if (_cableRender == null) return;
+        if (_cablePlayer != null && _cableBuf!.WaveFormat.SampleRate == _sampleRate) return;
+        try { _cablePlayer?.Stop(); _cablePlayer?.Dispose(); } catch { }
+        _cableBuf = new BufferedWaveProvider(new WaveFormat(_sampleRate, 16, 1))
         {
-            for (int i = off; i + 1 < off + n; i += 2)
+            BufferDuration = TimeSpan.FromMilliseconds(300),
+            DiscardOnBufferOverflow = true,
+            ReadFully = true
+        };
+        _cablePlayer = new WasapiOut(_cableRender, AudioClientShareMode.Shared, false, 30);
+        _cablePlayer.Init(_cableBuf);
+        _cablePlayer.Play();
+    }
+
+    private void StartMonitor()
+    {
+        if (_monitorPlayer != null) return;
+        try
+        {
+            _defaultSpeaker = GetEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+            _monitorBuf = new BufferedWaveProvider(new WaveFormat(_sampleRate, 16, 1))
             {
-                int s = BitConverter.ToInt16(buf, i);
-                s = Math.Clamp((int)(s * _gain), short.MinValue, short.MaxValue);
-                buf[i] = (byte)s; buf[i + 1] = (byte)(s >> 8);
-            }
+                BufferDuration = TimeSpan.FromMilliseconds(200),
+                DiscardOnBufferOverflow = true,
+                ReadFully = true
+            };
+            _monitorPlayer = new WasapiOut(_defaultSpeaker, AudioClientShareMode.Shared, false, 30);
+            _monitorPlayer.Init(_monitorBuf);
+            _monitorPlayer.Play();
         }
-        _provider.AddSamples(buf, off, n);
-        if (_provider.BufferedDuration.TotalMilliseconds > 250) _provider.ClearBuffer();
+        catch (Exception ex) { OnLog?.Invoke("侦听启动失败: " + ex.Message); }
+    }
+
+    private void StopMonitor()
+    {
+        try { _monitorPlayer?.Stop(); _monitorPlayer?.Dispose(); } catch { }
+        _monitorPlayer = null;
+    }
+
+    // ---------- 核心：一条进、两路出 ----------
+
+    private void Feed(byte[] buf, int off, int n, float cableGain)
+    {
+        if (_cableBuf == null) return;
+
+        _bytesWindow += n;
+        var now = Environment.TickCount64;
+        if (now - _windowStart >= 1000)
+        {
+            var kbps = (int)(_bytesWindow * 8 / (now - _windowStart)); // *1000/1024≈*1
+            OnBitrate?.Invoke(kbps);
+            _bytesWindow = 0; _windowStart = now;
+        }
+
+        // 主路：增益后写虚拟声卡（其他应用拿到的是这个）
+        if (Math.Abs(cableGain - 1f) > 0.01f) ScaleInPlace(buf, off, n, cableGain);
+        _cableBuf.AddSamples(buf, off, n);
+        if (_cableBuf.BufferedDuration.TotalMilliseconds > 250) _cableBuf.ClearBuffer();
+
+        // 侦听：复制一份原样数据到扬声器（独立于虚拟声卡）
+        if (_monitorEnabled && _monitorBuf != null)
+        {
+            var copy = new byte[n];
+            Array.Copy(buf, off, copy, 0, n);
+            if (Math.Abs(_monitorGain - 1f) > 0.01f) ScaleInPlace(copy, 0, n, _monitorGain);
+            _monitorBuf.AddSamples(copy, 0, n);
+            if (_monitorBuf.BufferedDuration.TotalMilliseconds > 200) _monitorBuf.ClearBuffer();
+        }
 
         short max = 0;
         for (int i = off; i + 1 < off + n; i += 2)
@@ -123,9 +186,46 @@ public class MicServer : IDisposable
         OnLevel?.Invoke(max / 32768f);
     }
 
-    private async Task TcpLoop(int port, CancellationToken ct)
+    private static void ScaleInPlace(byte[] buf, int off, int n, float g)
     {
-        var listener = new TcpListener(IPAddress.Any, port);
+        for (int i = off; i + 1 < off + n; i += 2)
+        {
+            int s = BitConverter.ToInt16(buf, i);
+            int v = (int)(s * g);
+            if (v > short.MaxValue) v = short.MaxValue; else if (v < short.MinValue) v = short.MinValue;
+            buf[i] = (byte)v; buf[i + 1] = (byte)(v >> 8);
+        }
+    }
+
+    // 自适应采样率：帧头 4 字节小端 sr
+    private void FeedFrame(byte[] buf, int n)
+    {
+        if (n >= 4)
+        {
+            int sr = BitConverter.ToInt32(buf, 0);
+            if (sr is 48000 or 16000 or 44100)
+            {
+                if (sr != _sampleRate)
+                {
+                    _sampleRate = sr;
+                    System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                    {
+                        EnsureCablePlayer();
+                        if (_monitorEnabled) { StopMonitor(); StartMonitor(); }
+                    });
+                }
+                Feed(buf, 4, n - 4, _gain);
+                return;
+            }
+        }
+        Feed(buf, 0, n, _gain);
+    }
+
+    // ---------- 三种监听循环 ----------
+
+    private async Task TcpLoop(IPAddress bind, int port, CancellationToken ct)
+    {
+        var listener = new TcpListener(bind, port);
         listener.Start();
         try
         {
@@ -143,11 +243,11 @@ public class MicServer : IDisposable
                     var buf = new byte[8192];
                     int rd;
                     while (!ct.IsCancellationRequested && (rd = await ns.ReadAsync(buf, ct)) > 0)
-                        Feed(buf, rd);
+                        FeedFrame(buf, rd);
                 }
                 catch { }
                 client.Dispose();
-                OnClientChanged?.Invoke("未连接");
+                OnClientChanged?.Invoke("未连接 / Idle");
                 OnLevel?.Invoke(0);
             }
         }
@@ -163,11 +263,28 @@ public class MicServer : IDisposable
             {
                 var r = await udp.ReceiveAsync(ct);
                 OnClientChanged?.Invoke($"UDP: {r.RemoteEndPoint}");
-                Feed(r.Buffer, r.Buffer.Length);
+                FeedFrame(r.Buffer, r.Buffer.Length);
             }
             catch { break; }
         }
         OnLevel?.Invoke(0);
+    }
+
+    /// <summary>USB 模式：自动循环 adb reverse 直到手机出现，再当 TCP 服务端。</summary>
+    private async Task UsbLoop(int port, CancellationToken ct)
+    {
+        // 持续尝试 adb reverse（手机插上/授权后能自动通）
+        _usbRetryTask = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var ok = EndpointManager.AdbReverse(port);
+                OnClientChanged?.Invoke(ok ? "USB: adb 已转发，等待手机推流…" : "USB: 等待 adb 设备…");
+                if (ok) break;
+                await Task.Delay(1500, ct).ContinueWith(_ => { });
+            }
+        }, ct);
+        await TcpLoop(IPAddress.Loopback, port, ct);
     }
 
     private async Task BtLoop(CancellationToken ct)
@@ -181,7 +298,7 @@ public class MicServer : IDisposable
         }
         catch (Exception ex)
         {
-            OnLog?.Invoke("蓝牙不可用，请在系统设置里打开蓝牙并确认配对: " + ex.Message);
+            OnLog?.Invoke("蓝牙不可用(在PC开蓝牙并与手机配对): " + ex.Message);
             return;
         }
         while (!ct.IsCancellationRequested)
@@ -194,25 +311,13 @@ public class MicServer : IDisposable
                 var buf = new byte[8192];
                 int rd;
                 while (!ct.IsCancellationRequested && (rd = await ns.ReadAsync(buf, ct)) > 0)
-                    Feed(buf, rd);
+                    FeedFrame(buf, rd);
                 client.Dispose();
-                OnClientChanged?.Invoke("未连接");
+                OnClientChanged?.Invoke("未连接 / Idle");
                 OnLevel?.Invoke(0);
             }
             catch { break; }
         }
         listener.Stop();
     }
-
-    public void Stop()
-    {
-        _cts?.Cancel();
-        try { _player?.Stop(); _player?.Dispose(); } catch { }
-        _player = null;
-        try { _renderDevice?.Dispose(); } catch { }
-        _renderDevice = null;
-        OnLevel?.Invoke(0);
-    }
-
-    public void Dispose() => Stop();
 }
