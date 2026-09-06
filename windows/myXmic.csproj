@@ -14,7 +14,7 @@
 
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />
-    <PackageReference Include="InTheHand.Net.Bluetooth" Version="4.0.35" />
+    <PackageReference Include="InTheHand.Net.Bluetooth" Version="4.0.*" />
   </ItemGroup>
 
 
