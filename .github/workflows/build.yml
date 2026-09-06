@@ -1,0 +1,83 @@
+name: Build & Release (APK + EXE)
+
+on:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write   # 用于自动创建 Release
+  issues: write     # 构建失败时自动报日志
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.2"
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon
+      - name: Stash APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "6.0.x"
+      - name: Publish single-file exe
+        working-directory: windows
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained /p:PublishSingleFile=true 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Push build log to branch on failure
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p logs
+          tail -n 120 windows/build.log > logs/win-error.txt || true
+          git config user.name ci && git config user.email ci@users.noreply.github.com
+          git checkout --orphan build-logs || true
+          git add logs/win-error.txt -f
+          git commit -m "build log $(date +%s)" -q
+          git push -f origin build-logs
+      - name: Stash EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: exe
+          path: windows/bin/Release/net6.0-windows/win-x64/publish/myXmic.exe
+
+  release:
+    needs: [android-apk, windows-exe]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: 整理产物
+        run: |
+          mkdir out
+          cp dist/apk/app-debug.apk out/myXmic.apk
+          cp dist/exe/myXmic.exe out/myXmic.exe
+      - name: 发布到 Release (tag=latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest          # 固定 tag：每次构建覆盖，永远是最新版
+          name: 最新构建（自动更新）
+          body: |
+            每次 push 自动构建的最新版本。
+            - **myXmic.apk**：Android 手机安装包
+            - **myXmic.exe**：Windows 单文件程序（需右键无，直接双击，弹 UAC 允许即可）
+          files: out/*
+          make_latest: true

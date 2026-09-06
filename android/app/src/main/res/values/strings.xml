@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">myXmic</string>
+    <string name="mode">连接方式</string>
+    <string name="wifi">Wi-Fi</string>
+    <string name="usb">USB</string>
+    <string name="bluetooth">蓝牙</string>
+    <string name="protocol">传输协议</string>
+    <string name="server_ip">服务器 IP</string>
+    <string name="auto_find">自动搜索</string>
+    <string name="port">端口</string>
+    <string name="sample_rate">采样率</string>
+    <string name="gain">音量增益</string>
+    <string name="ns">降噪 (NS)</string>
+    <string name="aec">回声消除 (AEC)</string>
+    <string name="start">开始</string>
+    <string name="stop">停止</string>
+    <string name="status_idle">未连接</string>
+    <string name="status_connecting">连接中…</string>
+    <string name="status_streaming">推流中</string>
+    <string name="need_mic_perm">请先授予麦克风权限</string>
+    <string name="usb_hint">USB 模式需电脑端 adb 已连接，IP 填 127.0.0.1</string>
+    <string name="bt_hint">蓝牙模式需先在系统里配对电脑</string>
+    <string name="not_found">未发现服务器，请检查电脑端是否已启动</string>
+    <string name="lang_switch">English</string>
+</resources>
