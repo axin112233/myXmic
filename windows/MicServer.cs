@@ -125,29 +125,33 @@ public class MicServer : IDisposable
 
     private async Task TcpLoop(int port, CancellationToken ct)
     {
-        using var listener = new TcpListener(IPAddress.Any, port);
+        var listener = new TcpListener(IPAddress.Any, port);
         listener.Start();
-        while (!ct.IsCancellationRequested)
+        try
         {
-            TcpClient client;
-            try { client = await listener.AcceptTcpClientAsync(ct); }
-            catch { break; }
-            var ep = client.Client.RemoteEndPoint?.ToString() ?? "?";
-            OnClientChanged?.Invoke($"TCP: {ep}");
-            try
+            while (!ct.IsCancellationRequested)
             {
-                client.NoDelay = true;
-                using var ns = client.GetStream();
-                var buf = new byte[8192];
-                int rd;
-                while (!ct.IsCancellationRequested && (rd = await ns.ReadAsync(buf, ct)) > 0)
-                    Feed(buf, rd);
+                TcpClient client;
+                try { client = await listener.AcceptTcpClientAsync(ct); }
+                catch { break; }
+                var ep = client.Client.RemoteEndPoint?.ToString() ?? "?";
+                OnClientChanged?.Invoke($"TCP: {ep}");
+                try
+                {
+                    client.NoDelay = true;
+                    using var ns = client.GetStream();
+                    var buf = new byte[8192];
+                    int rd;
+                    while (!ct.IsCancellationRequested && (rd = await ns.ReadAsync(buf, ct)) > 0)
+                        Feed(buf, rd);
+                }
+                catch { }
+                client.Dispose();
+                OnClientChanged?.Invoke("未连接");
+                OnLevel?.Invoke(0);
             }
-            catch { }
-            client.Dispose();
-            OnClientChanged?.Invoke("未连接");
-            OnLevel?.Invoke(0);
         }
+        finally { listener.Stop(); }
     }
 
     private async Task UdpLoop(int port, CancellationToken ct)
