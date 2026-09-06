@@ -47,7 +47,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $log = Get-Content windows/build.log -Tail 80 -Raw
-          gh issue create --title "[auto] windows build failure" --body "````n$log`n```" --label build-failure
+          gh label create build-failure --force | Out-Null
+          gh issue create --title "[auto] windows build failure $(Get-Date -Format s)" --body "````n$log`n```" --label build-failure
       - name: Stash EXE
         uses: actions/upload-artifact@v4
         with:
